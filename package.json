@@ -1,6 +1,6 @@
 {
   "name": "cc-gist-export",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Export Claude Code session JSONL to a GitHub Gist as Markdown",
   "bin": {
     "cc-gist-export": "bin/cc-gist-export.js"
