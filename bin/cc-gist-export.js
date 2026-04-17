@@ -150,7 +150,7 @@ function pickWithFzf(sessions) {
       "--ansi",
       "--prompt=session> ",
       "--with-nth=2,3",
-      "--nth=2",
+      "--nth=3",
       "--delimiter=\t",
       "--tiebreak=begin,index",
       "--height=60%",
