@@ -8,8 +8,11 @@ upload, so auth is whatever `gh` already has.
 ## Usage
 
 ```sh
-# Export latest session of current project (secret gist)
+# Pick session via fuzzy picker (fzf if installed, otherwise a numbered prompt)
 npx cc-gist-export
+
+# Skip the picker and take the latest session
+npx cc-gist-export --latest
 
 # Public gist and open in browser
 npx cc-gist-export --public --open
@@ -38,6 +41,7 @@ npx cc-gist-export --list
 | `--stdout`      | off     | Print markdown to stdout, skip upload        |
 | `--no-thinking` | off     | Skip assistant `thinking` blocks             |
 | `--no-tools`    | off     | Skip `tool_use` / `tool_result` blocks       |
+| `--latest`      | off     | Take most recent session, skip the picker    |
 | `--list`        | off     | List recent sessions for current project     |
 | `-h`, `--help`  |         | Show help                                    |
 

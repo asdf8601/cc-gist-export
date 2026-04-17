@@ -5,6 +5,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const readline = require("node:readline");
 const { spawnSync } = require("node:child_process");
 
 const HELP = `cc-gist-export — export Claude Code session to a GitHub Gist
@@ -12,7 +13,9 @@ const HELP = `cc-gist-export — export Claude Code session to a GitHub Gist
 Usage:
   cc-gist-export [SESSION.jsonl] [options]
 
-If SESSION is omitted, picks the most recent session of the current cwd project.
+If SESSION is omitted, opens a fuzzy picker (fzf) over recent sessions of the
+current cwd project, pre-highlighted on the most recent one. Pass --latest to
+skip the picker and take the newest session automatically.
 
 Options:
   --public            Public gist (default: secret)
@@ -22,6 +25,7 @@ Options:
   --stdout            Print markdown to stdout (no upload)
   --no-thinking       Skip assistant thinking blocks
   --no-tools          Skip tool_use and tool_result blocks
+  --latest            Pick most recent session, skip the picker
   --list              List recent sessions for the current project
   -h, --help          Show this help
 `;
@@ -37,6 +41,7 @@ function parseArgs(argv) {
     noThinking: false,
     noTools: false,
     list: false,
+    latest: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -49,6 +54,7 @@ function parseArgs(argv) {
     else if (a === "--no-thinking") opts.noThinking = true;
     else if (a === "--no-tools") opts.noTools = true;
     else if (a === "--list") opts.list = true;
+    else if (a === "--latest") opts.latest = true;
     else if (a === "--title") opts.title = argv[++i];
     else if (a === "--out") opts.out = argv[++i];
     else if (a.startsWith("--")) {
@@ -80,13 +86,117 @@ function listSessions(dir) {
     .sort((a, b) => b.mtime - a.mtime);
 }
 
-function resolveSession(arg) {
-  if (arg) {
-    if (!fs.existsSync(arg)) {
-      console.error(`not found: ${arg}`);
+function sessionTitle(file) {
+  // Read first user text message for a human-friendly title.
+  try {
+    const raw = fs.readFileSync(file, "utf8");
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let d;
+      try {
+        d = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const m = d.message;
+      if (d.type !== "user" || !m) continue;
+      const c = m.content;
+      let text = null;
+      if (typeof c === "string") text = c;
+      else if (Array.isArray(c)) {
+        const t = c.find((x) => x && x.type === "text" && x.text);
+        if (t) text = t.text;
+      }
+      if (!text) continue;
+      if (/^\s*<(system-reminder|command-name|local-command)/i.test(text))
+        continue;
+      const clean = text
+        .replace(/<command-[^>]*>[^<]*<\/command-[^>]*>/gi, "")
+        .replace(/<[^>]+>/g, "")
+        .replace(/^\s*(Human|H|User):\s*/i, "")
+        .replace(/\s+/g, " ")
+        .replace(/^[#>*\-\d.\s]+/, "")
+        .trim();
+      if (clean) return clean.slice(0, 120);
+    }
+  } catch {}
+  return "(no user prompt)";
+}
+
+function humanAge(ms) {
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+function which(cmd) {
+  const r = spawnSync("sh", ["-c", `command -v ${cmd}`], { encoding: "utf8" });
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+
+function pickWithFzf(sessions) {
+  const lines = sessions
+    .map((s, i) => {
+      const age = humanAge(s.mtime).padStart(4);
+      const title = sessionTitle(s.path);
+      return `${String(i).padStart(3)}\t${age}  ${title}\t${s.path}`;
+    })
+    .join("\n");
+  const res = spawnSync(
+    "fzf",
+    [
+      "--ansi",
+      "--prompt=session> ",
+      "--with-nth=2",
+      "--delimiter=\t",
+      "--height=60%",
+      "--reverse",
+      "--border",
+      "--no-sort",
+    ],
+    { input: lines, encoding: "utf8", stdio: ["pipe", "pipe", "inherit"] },
+  );
+  if (res.status !== 0) return null;
+  const picked = res.stdout.trim();
+  if (!picked) return null;
+  return picked.split("\t")[2];
+}
+
+function pickWithReadline(sessions) {
+  console.error("Recent sessions:");
+  const shown = sessions.slice(0, 20);
+  for (let i = 0; i < shown.length; i++) {
+    const age = humanAge(shown[i].mtime);
+    console.error(
+      `  [${i}] ${age.padStart(4)}  ${sessionTitle(shown[i].path)}`,
+    );
+  }
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stderr,
+    });
+    rl.question("Pick [0]: ", (ans) => {
+      rl.close();
+      const i = ans.trim() === "" ? 0 : Number(ans.trim());
+      if (!Number.isInteger(i) || i < 0 || i >= shown.length) {
+        console.error("invalid selection");
+        process.exit(1);
+      }
+      resolve(shown[i].path);
+    });
+  });
+}
+
+async function resolveSession(opts) {
+  if (opts.file) {
+    if (!fs.existsSync(opts.file)) {
+      console.error(`not found: ${opts.file}`);
       process.exit(1);
     }
-    return arg;
+    return opts.file;
   }
   const dir = cwdProjectDir();
   const sessions = listSessions(dir);
@@ -94,7 +204,25 @@ function resolveSession(arg) {
     console.error(`no sessions found in ${dir}`);
     process.exit(1);
   }
-  return sessions[0].path;
+  if (opts.latest || sessions.length === 1) return sessions[0].path;
+
+  const interactive = process.stdin.isTTY && process.stderr.isTTY;
+  if (!interactive) {
+    console.error(
+      "Non-interactive shell — using latest session. Pass --latest to silence.",
+    );
+    return sessions[0].path;
+  }
+
+  if (which("fzf")) {
+    const picked = pickWithFzf(sessions);
+    if (!picked) {
+      console.error("picker cancelled");
+      process.exit(130);
+    }
+    return picked;
+  }
+  return pickWithReadline(sessions);
 }
 
 function readJsonl(file) {
@@ -128,15 +256,6 @@ function stringifyToolInput(input) {
   } catch {
     return String(input);
   }
-}
-
-function extractText(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((c) => c && c.type === "text")
-    .map((c) => c.text || "")
-    .join("\n");
 }
 
 function renderToolResult(c) {
@@ -262,7 +381,7 @@ function upload(mdFile, { isPublic, title, open }) {
   }
 }
 
-function main() {
+async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
   if (opts.list) {
@@ -273,12 +392,14 @@ function main() {
       process.exit(1);
     }
     for (const s of sessions.slice(0, 20)) {
-      console.log(`${new Date(s.mtime).toISOString()}  ${s.path}`);
+      console.log(
+        `${new Date(s.mtime).toISOString()}  ${sessionTitle(s.path)}  ${s.path}`,
+      );
     }
     return;
   }
 
-  const file = resolveSession(opts.file);
+  const file = await resolveSession(opts);
   const records = readJsonl(file);
   const md = toMarkdown(records, opts);
 
