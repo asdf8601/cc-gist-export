@@ -141,7 +141,7 @@ function pickWithFzf(sessions) {
     .map((s, i) => {
       const age = humanAge(s.mtime).padStart(4);
       const title = sessionTitle(s.path);
-      return `${String(i).padStart(3)}\t${age}  ${title}\t${s.path}`;
+      return `${String(i).padStart(3)}\t${age}\t${title}\t${s.path}`;
     })
     .join("\n");
   const res = spawnSync(
@@ -149,19 +149,20 @@ function pickWithFzf(sessions) {
     [
       "--ansi",
       "--prompt=session> ",
-      "--with-nth=2",
+      "--with-nth=2,3",
+      "--nth=2",
       "--delimiter=\t",
+      "--tiebreak=begin,index",
       "--height=60%",
       "--reverse",
       "--border",
-      "--no-sort",
     ],
     { input: lines, encoding: "utf8", stdio: ["pipe", "pipe", "inherit"] },
   );
   if (res.status !== 0) return null;
   const picked = res.stdout.trim();
   if (!picked) return null;
-  return picked.split("\t")[2];
+  return picked.split("\t")[3];
 }
 
 function pickWithReadline(sessions) {
