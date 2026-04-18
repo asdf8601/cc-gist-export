@@ -86,41 +86,114 @@ function listSessions(dir) {
     .sort((a, b) => b.mtime - a.mtime);
 }
 
-function sessionTitle(file) {
-  // Read first user text message for a human-friendly title.
+const BODY_CAP = 200 * 1024;
+const PER_MSG_CAP = 8 * 1024;
+const WRAPPER_TAGS =
+  /<(system-reminder|command-name|command-args|local-command-stdout|local-command-stderr|command-message)[^>]*>[\s\S]*?<\/\1>/gi;
+
+function cleanFirstPrompt(text) {
+  if (/^\s*<(system-reminder|command-name|local-command)/i.test(text))
+    return null;
+  const clean = text
+    .replace(WRAPPER_TAGS, "")
+    .replace(/^\s*(Human|H|User):\s*/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[#>*\-\d.\s]+/, "")
+    .trim();
+  return clean || null;
+}
+
+function normalizeForBody(s) {
+  return String(s).replace(WRAPPER_TAGS, "").replace(/[\t\n\r]+/g, " ");
+}
+
+function pushBody(parts, used, s) {
+  if (!s) return used;
+  const room = BODY_CAP - used;
+  if (room <= 0) return used;
+  const chunk = s.length > PER_MSG_CAP ? s.slice(0, PER_MSG_CAP) : s;
+  const take = chunk.length > room ? chunk.slice(0, room) : chunk;
+  parts.push(take);
+  return used + take.length + 1;
+}
+
+function extractSessionMeta(file) {
+  const meta = { title: "(no user prompt)", body: "", isCustom: false };
+  let firstPrompt = null;
+  let customTitle = null;
+  const bodyParts = [];
+  let bodyUsed = 0;
+  let raw;
   try {
-    const raw = fs.readFileSync(file, "utf8");
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      let d;
-      try {
-        d = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const m = d.message;
-      if (d.type !== "user" || !m) continue;
-      const c = m.content;
-      let text = null;
-      if (typeof c === "string") text = c;
-      else if (Array.isArray(c)) {
-        const t = c.find((x) => x && x.type === "text" && x.text);
-        if (t) text = t.text;
-      }
-      if (!text) continue;
-      if (/^\s*<(system-reminder|command-name|local-command)/i.test(text))
-        continue;
-      const clean = text
-        .replace(/<command-[^>]*>[^<]*<\/command-[^>]*>/gi, "")
-        .replace(/<[^>]+>/g, "")
-        .replace(/^\s*(Human|H|User):\s*/i, "")
-        .replace(/\s+/g, " ")
-        .replace(/^[#>*\-\d.\s]+/, "")
-        .trim();
-      if (clean) return clean.slice(0, 120);
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return meta;
+  }
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let d;
+    try {
+      d = JSON.parse(line);
+    } catch {
+      continue;
     }
-  } catch {}
-  return "(no user prompt)";
+    if (d.type === "custom-title" && d.customTitle) {
+      customTitle = String(d.customTitle);
+      continue;
+    }
+    if (d.isSidechain) continue;
+    const m = d.message;
+    if (!m) continue;
+    const c = m.content;
+    if (d.type === "user" && m.role === "user") {
+      if (typeof c === "string") {
+        if (!firstPrompt) {
+          const clean = cleanFirstPrompt(c);
+          if (clean) firstPrompt = clean.slice(0, 120);
+        }
+        bodyUsed = pushBody(bodyParts, bodyUsed, normalizeForBody(c));
+      } else if (Array.isArray(c)) {
+        for (const x of c) {
+          if (!x || typeof x !== "object") continue;
+          if (x.type === "text" && x.text) {
+            if (!firstPrompt) {
+              const clean = cleanFirstPrompt(x.text);
+              if (clean) firstPrompt = clean.slice(0, 120);
+            }
+            bodyUsed = pushBody(bodyParts, bodyUsed, normalizeForBody(x.text));
+          }
+        }
+      }
+    } else if (d.type === "assistant" && Array.isArray(c)) {
+      for (const x of c) {
+        if (!x || typeof x !== "object") continue;
+        if (x.type === "text" && x.text) {
+          bodyUsed = pushBody(bodyParts, bodyUsed, normalizeForBody(x.text));
+        } else if (x.type === "tool_use") {
+          const parts = [x.name || "tool"];
+          if (x.input && typeof x.input === "object") {
+            for (const v of Object.values(x.input)) {
+              if (typeof v === "string") parts.push(v);
+            }
+          }
+          bodyUsed = pushBody(
+            bodyParts,
+            bodyUsed,
+            normalizeForBody(parts.join(" ")),
+          );
+        }
+      }
+    }
+    if (bodyUsed >= BODY_CAP && firstPrompt && customTitle) break;
+  }
+  meta.isCustom = customTitle != null;
+  meta.title = customTitle || firstPrompt || "(no user prompt)";
+  meta.body = bodyParts.join(" ");
+  return meta;
+}
+
+function sessionTitle(file) {
+  return extractSessionMeta(file).title;
 }
 
 function humanAge(ms) {
@@ -136,12 +209,20 @@ function which(cmd) {
   return r.status === 0 ? r.stdout.trim() : null;
 }
 
+const BODY_ROW_CAP = 4 * 1024;
+
 function pickWithFzf(sessions) {
   const lines = sessions
     .map((s, i) => {
       const age = humanAge(s.mtime).padStart(4);
-      const title = sessionTitle(s.path);
-      return `${String(i).padStart(3)}\t${age}\t${title}\t${s.path}`;
+      const meta = extractSessionMeta(s.path);
+      const mark = meta.isCustom ? "★ " : "  ";
+      const title = (mark + meta.title).replace(/[\t\n\r]+/g, " ");
+      const body = meta.body.slice(0, BODY_ROW_CAP).replace(/[\t\n\r]+/g, " ");
+      const titleCol = body
+        ? `${title} \x1b[90m· ${body}\x1b[0m`
+        : title;
+      return `${String(i).padStart(3)}\t${age}\t${titleCol}\t${s.path}`;
     })
     .join("\n");
   const res = spawnSync(
@@ -150,19 +231,20 @@ function pickWithFzf(sessions) {
       "--ansi",
       "--prompt=session> ",
       "--with-nth=2,3",
-      "--nth=3",
       "--delimiter=\t",
       "--tiebreak=begin,index",
       "--height=60%",
       "--reverse",
       "--border",
+      "--no-hscroll",
     ],
     { input: lines, encoding: "utf8", stdio: ["pipe", "pipe", "inherit"] },
   );
   if (res.status !== 0) return null;
   const picked = res.stdout.trim();
   if (!picked) return null;
-  return picked.split("\t")[3];
+  const cols = picked.split("\t");
+  return cols[cols.length - 1];
 }
 
 function pickWithReadline(sessions) {
@@ -170,8 +252,10 @@ function pickWithReadline(sessions) {
   const shown = sessions.slice(0, 20);
   for (let i = 0; i < shown.length; i++) {
     const age = humanAge(shown[i].mtime);
+    const meta = extractSessionMeta(shown[i].path);
+    const mark = meta.isCustom ? "★" : " ";
     console.error(
-      `  [${i}] ${age.padStart(4)}  ${sessionTitle(shown[i].path)}`,
+      `  [${i}] ${age.padStart(4)}  ${mark} ${meta.title}`,
     );
   }
   return new Promise((resolve) => {
@@ -393,8 +477,10 @@ async function main() {
       process.exit(1);
     }
     for (const s of sessions.slice(0, 20)) {
+      const meta = extractSessionMeta(s.path);
+      const mark = meta.isCustom ? "★ " : "";
       console.log(
-        `${new Date(s.mtime).toISOString()}  ${sessionTitle(s.path)}  ${s.path}`,
+        `${new Date(s.mtime).toISOString()}  ${mark}${meta.title}  ${s.path}`,
       );
     }
     return;
