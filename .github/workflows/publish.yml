@@ -1,4 +1,4 @@
-name: publish
+name: release
 
 on:
   push:
@@ -6,26 +6,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+      issues: write
+      pull-requests: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: Publish if version changed
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          NAME=$(node -p "require('./package.json').name")
-          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
-            echo "$NAME@$VERSION already published, skip"
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          else
-            npm publish --access public --provenance
-            echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "Published $NAME@$VERSION"
-          fi
+      - name: Install semantic-release
+        run: npm install --no-save semantic-release @semantic-release/changelog @semantic-release/git @semantic-release/exec
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
